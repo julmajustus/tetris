@@ -2,6 +2,7 @@
  *
  * Copyright (c) 1989  John Tromp <john.tromp@gmail.com>
  * Copyright (c) 2009-2021  Joachim Wiberg <troglobit@gmail.com>
+ * Copyright (c) 2025  julmajustus <julmajustus@tutanota.com>
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -26,9 +27,12 @@
 #include <string.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <limits.h>
 
 #define clrscr()       puts ("\033[2J\033[1;1H")
 #define gotoxy(x,y)    printf("\033[%d;%dH", y, x)
@@ -58,16 +62,20 @@
 #define BR     B_COLS+1		/* bottom right */
 
 /* These can be overridden by the user. */
-#define DEFAULT_KEYS "jkl pq"
-#define KEY_LEFT   0
-#define KEY_RIGHT  2
-#define KEY_ROTATE 1
-#define KEY_DROP   3
-#define KEY_PAUSE  4
-#define KEY_QUIT   5
+#define DEFAULT_KEYS "hjkl pqr"
+#define KEY_LEFT    0
+#define KEY_RROTATE 1
+#define KEY_ROTATE  2
+#define KEY_RIGHT   3
+#define KEY_DROP    4
+#define KEY_PAUSE   5
+#define KEY_QUIT    6
+#define KEY_RESTART 7
 
-#define HIGH_SCORE_FILE "/var/games/tetris.scores"
 #define TEMP_SCORE_FILE "/tmp/tetris-tmp.scores"
+
+static char state_dir[PATH_MAX];
+static char high_score_file[PATH_MAX];
 
 static volatile sig_atomic_t running = 1;
 
@@ -76,7 +84,7 @@ static int havemodes = 0;
 
 static char *keys = DEFAULT_KEYS;
 static int level = 1;
-static int points = 0;
+static long points = 0;
 static int lines_cleared = 0;
 static int board[B_SIZE], shadow[B_SIZE];
 
@@ -106,6 +114,46 @@ static int shapes[] = {
 	 5, TC, BC, BL, 6,	/* _| */
 	 6, TC, BC,  2 * B_COLS, 7, /* | sticks out */
 };
+
+static void init_high_score_file(void)
+{
+    const char *xdg = getenv("XDG_STATE_HOME");
+    const char *home = getenv("HOME");
+    const char *base;
+
+    if (xdg && *xdg) {
+        base = xdg;
+    } else if (home && *home) {
+        base = home;
+    } else {
+        fputs("ERROR: neither XDG_STATE_HOME nor HOME is set\n", stderr);
+        exit(1);
+    }
+
+    if (xdg && *xdg) {
+        if (snprintf(state_dir, sizeof state_dir, "%s/games", base) >= (int)sizeof state_dir) {
+            fputs("ERROR: state_dir path too long\n", stderr);
+            exit(1);
+        }
+    } else {
+        if (snprintf(state_dir, sizeof state_dir,
+                     "%s/.local/state/games", base) >= (int)sizeof state_dir) {
+            fputs("ERROR: state_dir path too long\n", stderr);
+            exit(1);
+        }
+    }
+
+    if (mkdir(state_dir, 0755) != 0 && errno != EEXIST) {
+        perror("mkdir(state_dir)");
+        exit(1);
+    }
+
+    if (snprintf(high_score_file, sizeof high_score_file,
+                 "%s/tetris.scores", state_dir) >= (int)sizeof high_score_file) {
+        fputs("ERROR: high_score_file path too long\n", stderr);
+        exit(1);
+    }
+}
 
 static void draw(int x, int y, int c)
 {
@@ -162,7 +210,7 @@ static int update(void)
 	gotoxy(26 + 28, 2);
 	printf("\033[0mLevel  : %d", level);
 	gotoxy(26 + 28, 3);
-	printf("Points : %d", points);
+	printf("Points : %ld", points);
 #endif
 #ifdef ENABLE_PREVIEW
 	gotoxy(26 + 28, 5);
@@ -210,27 +258,42 @@ static int *next_shape(void)
 static void show_high_score(void)
 {
 #ifdef ENABLE_HIGH_SCORE
-	FILE *tmpscore;
+    FILE *tmpscore;
 
-	if ((tmpscore = fopen(HIGH_SCORE_FILE, "a"))) {
-		char *name = getenv("LOGNAME");
+    if ((tmpscore = fopen(high_score_file, "a"))) {
+        char *name = getenv("LOGNAME");
 
-		if (!name)
-			name = "anonymous";
+        if (!name)
+            name = "anonymous";
 
-		fprintf(tmpscore, "%7d\t %5d\t  %3d\t%s\n", points * level, points, level, name);
-		fclose(tmpscore);
+        fprintf(tmpscore, "%7ld\t %5ld\t  %3d\t%s\n",
+                (long)points * level,
+                (long)points,
+                level,
+                name);
+        fclose(tmpscore);
 
-		system("cat " HIGH_SCORE_FILE "| sort -rn | head -10 >" TEMP_SCORE_FILE
-		       "&& cp " TEMP_SCORE_FILE " " HIGH_SCORE_FILE);
-		remove(TEMP_SCORE_FILE);
-	}
+        char cmd[PATH_MAX * 2 + 128];
 
-	if (!access(HIGH_SCORE_FILE, R_OK)) {
-//		puts("\nHit RETURN to see high scores, ^C to skip.");
-		fprintf(stderr, "  Score\tPoints\tLevel\tName\n");
-		system("cat " HIGH_SCORE_FILE);
-	}
+        snprintf(cmd, sizeof(cmd),
+            "cat \"%s\" | sort -rn | head -10 > \"%s\" && "
+            "cp \"%s\" \"%s\"",
+            high_score_file, TEMP_SCORE_FILE,
+            TEMP_SCORE_FILE, high_score_file);
+
+        system(cmd);
+        remove(TEMP_SCORE_FILE);
+    }
+
+    if (access(high_score_file, R_OK) == 0) {
+        fprintf(stderr, "  Score\tPoints\tLevel\tName\n");
+
+        char view_cmd[PATH_MAX + 32];
+        snprintf(view_cmd, sizeof(view_cmd),
+            "cat \"%s\"",
+            high_score_file);
+        system(view_cmd);
+    }
 #endif /* ENABLE_HIGH_SCORE */
 }
 
@@ -239,16 +302,20 @@ static void show_online_help(void)
 	const int start = 11;
 
 	gotoxy(26 + 28, start);
-	puts("\033[0mj     - left");
+	puts("\033[0mh     - left");
 	gotoxy(26 + 28, start + 1);
-	puts("k     - rotate");
+	puts("j     - reverse rotate");
 	gotoxy(26 + 28, start + 2);
-	puts("l     - right");
+	puts("k     - rotate");
 	gotoxy(26 + 28, start + 3);
-	puts("space - drop");
+	puts("l     - right");
 	gotoxy(26 + 28, start + 4);
-	puts("p     - pause");
+	puts("space - drop");
 	gotoxy(26 + 28, start + 5);
+	puts("p     - pause");
+	gotoxy(26 + 28, start + 6);
+	puts("r     - restart");
+	gotoxy(26 + 28, start + 7);
 	puts("q     - quit");
 }
 
@@ -325,54 +392,121 @@ static void sig_init(void)
 	/* Start update timer. */
 	alarm_handler(0);
 }
+static void init(int *c, int *pos ) 
+{
+	int i, *ptr;
+
+	level = 1;
+	points = 0;
+	lines_cleared = 0;
+	*c = 0;
+	*pos = 17;
+	ptr = board;
+	
+	/* Initialize board, grey border, used to be white(7) */
+	for (i = B_SIZE; i; i--)
+		*ptr++ = i < 25 || i % B_COLS < 2 ? 60 : 0;
+	for (i = B_SIZE; i--; shadow[i] = 0)
+		;
+	clrscr();
+	/* Set up signals */
+	alarm_handler(0);
+	show_online_help();
+	shape = next_shape();
+}
 
 int main(void)
 {
-	int c = 0, i, j, *ptr;
-	int pos = 17;
+	int i, c = 0, pos;
 	int *backup;
-
-	/* Initialize board, grey border, used to be white(7) */
-	ptr = board;
-	for (i = B_SIZE; i; i--)
-		*ptr++ = i < 25 || i % B_COLS < 2 ? 60 : 0;
 
 	srand((unsigned int)time(NULL));
 	if (tty_init() == -1)
 		return 1;
+	
+	init_high_score_file();
 
 	/* Set up signals */
 	sig_init();
+	
+	init(&c, &pos);
 
-	clrscr();
-	show_online_help();
-
-	shape = next_shape();
 	while (running) {
 		if (c < 0) {
 			if (fits_in(shape, pos + B_COLS)) {
 				pos += B_COLS;
 			} else {
 				place(shape, pos, color);
-				++points;
-				for (j = 0; j < 252; j = B_COLS * (j / B_COLS + 1)) {
-					for (; board[++j];) {
-						if (j % B_COLS == 10) {
-							lines_cleared++;
-
-							for (; j % B_COLS; board[j--] = 0)
-							   ;
-							c = update();
-
-							for (; --j; board[j + B_COLS] = board[j])
-							   ;
-							c = update();
+				int clears = 0;
+				for (i = 1; i < B_ROWS-2; ++i) {
+					int full = 1;
+					for (int x = 1; x < B_COLS-1; ++x) {
+						if (!board[i * B_COLS + x]) {
+							full = 0;
+							break;
 						}
 					}
+					if (full) {
+						++clears;
+						/* clear row i */
+						for (int x = 1; x < B_COLS-1; ++x)
+							board[i * B_COLS + x] = 0;
+						c = update();
+
+						/* shift everything above row i down one */
+						for (int y = i; y > 0; --y) {
+							for (int x = 1; x < B_COLS-1; ++x)
+								board[y * B_COLS + x] = board[(y-1) * B_COLS + x];
+						}
+						c = update();
+						/* re‐check this same row index next iteration */
+						--i;
+					}
 				}
+
+				if (clears > 0) {
+					static const int score_table[5] = {
+						0,
+						40,
+						100,
+						300,
+						1200
+					};
+					double ofcheck = points + score_table[clears] * level;
+					if (ofcheck > LONG_MAX) {
+						clrscr();
+						gotoxy(0, 0);
+						printf("\n\nYOU HAVE WON\n\n");
+						printf("\033[0mYour score: %ld points x level %d = %ld\n\n", points, level, points * level);
+						show_high_score();
+						sleep(5);
+						break;
+					}
+					points += score_table[clears] * level;
+					lines_cleared += clears;
+				}
+				c = update();
 				shape = next_shape();
-				if (!fits_in(shape, pos = 17))
-					c = keys[KEY_QUIT];
+				if (!fits_in(shape, pos = 17)) {
+					clrscr();
+					gotoxy(0, 0);
+					printf("");
+					printf("\n\nYOU HAVE FAILED!\n\n\033[0mYour score: %ld points x level %d = %ld\n\n", points, level, points * level);
+					show_high_score();
+					freeze(1);
+					printf("\n\nPress 'r' for replay or 'q' for quit!\n");
+					while ((c = getchar())) {
+						if (c == keys[KEY_QUIT] || c == keys[KEY_RESTART])
+							break;
+					}
+					if (c == keys[KEY_QUIT])
+						break;
+					else
+						freeze(0);
+
+					init(&c, &pos);
+					continue;
+				}
 			}
 		}
 
@@ -382,6 +516,21 @@ int main(void)
 		}
 
 		if (c == keys[KEY_ROTATE]) {
+			backup = shape;
+			int curr_idx = (shape - shapes) / 5;
+			int prev_idx = curr_idx;
+			for (int i = 0; i < 19; i++) {
+				if (shapes[5*i + 0] == curr_idx) {
+					prev_idx = i;
+					break;
+				}
+			}
+			shape = &shapes[5 * prev_idx];
+			if (!fits_in(shape, pos))
+				shape = backup;
+		}
+		
+		if (c == keys[KEY_RROTATE]) {
 			backup = shape;
 			shape = &shapes[5 * *shape];	/* Rotate */
 			/* Check if it fits, if not restore shape from backup */
@@ -399,6 +548,11 @@ int main(void)
 				pos += B_COLS;
 		}
 
+		if (c == keys[KEY_RESTART]) {
+			init(&c, &pos);
+			continue;
+		}
+
 		if (c == keys[KEY_PAUSE] || c == keys[KEY_QUIT]) {
 			freeze(1);
 
@@ -406,18 +560,18 @@ int main(void)
 				clrscr();
 				gotoxy(0, 0);
 
-				printf("\033[0mYour score: %d points x level %d = %d\n\n", points, level, points * level);
+				printf("\033[0mYour score: %ld points x level %d = %ld\n\n", points, level, points * level);
 				show_high_score();
+				sleep(5);
 				break;
 			}
 
-			for (j = B_SIZE; j--; shadow[j] = 0)
+			for (i = B_SIZE; i--; shadow[i] = 0)
 			   ;
 
 			while (getchar() - keys[KEY_PAUSE])
 			   ;
 
-//			puts("\033[H\033[J\033[7m");
 			freeze(0);
 		}
 
@@ -432,10 +586,3 @@ int main(void)
 
 	return 0;
 }
-
-/**
- * Local Variables:
- *  indent-tabs-mode: t
- *  c-file-style: "linux"
- * End:
- */
